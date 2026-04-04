@@ -1,0 +1,6 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="mnistRecognition/mnistRecognition.vcxproj" Id="92389deb-7cac-4645-8759-612d8b6436b0" />
+</Solution>
