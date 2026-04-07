@@ -10,18 +10,21 @@
 #include <sycl/sycl.hpp>
 #include <iostream>
 #include <filesystem>
+#define STB_IMAGE_IMPLEMENTATION
+#include "VC_IncludePath\stb_image.h"
 using namespace sycl;
 using namespace std;
+using namespace filesystem;
 
 /*
 * The neural net is fixed at 4 layers(including input and output).
 * The input neuron count should be fixed for 28x28 images, and output neuron count should be fixed for numbers 0->9.
 * However, the neuron count of the intermediate layers can be chosen freely.
-* Furthermore, the batch size is fixed for 10 numbers, while the amount of batches can be lowered.
+* Furthermore, each batch contains each of the 10 numbers, and the amount of batches can be lowered.
 * The amount of epochs can be chosen freely.
 */
 const int lInSize = 784, l1Size = 16, l2Size = 16, lOutSize = 10;
-const int batchSize = 10, batchCount = 3795, epochcount = 10;
+const int batchCount = 3795, epochcount = 10;
 
 queue q;
 float* bias1;
@@ -41,11 +44,19 @@ float* sigmoidedOut;
 bool training;
 
 // ChatGPT made a device-based random value generator, which is applied over a list of values. A unique randID is also inputed, for variance over lists.
-inline void randomParamaterInit(float* paramaters, int size, int randID, queue& q) {
+inline void randomParamaterInit(float* paramaters, int size, int randID, queue& q, bool isBias) {
     q.submit([&](handler& h) {
         h.parallel_for(range<1>(size), [=](id<1> i) {
             float randVal = float(((i + randID * 10000000) ^ 0xA3B1C2D3) * 1664525 + 1013904223 & 0xFFFFFF) / float(0xFFFFFF); // Random value between 0 and 1
             paramaters[i] = randVal * 2 - 1;
+        });
+    });
+}
+
+inline void imageActivationInit(float* activations, int size, queue& q) {
+    q.submit([&](handler& h) {
+        h.parallel_for(range<1>(size), [=](id<1> i) {
+            activations[i] = 10000;
         });
     });
 }
@@ -74,22 +85,14 @@ inline void forwardPropogateLayer(float* prevSigmoidedLayer, int prevSize, float
             for (int j = 0; j < prevSize; j++) {
                 float lastSigmoidedActivation = prevSigmoidedLayer[j];
                 float connectionWeight = weights[i * prevSize + j];
-                curLayer[i] += lastSigmoidedActivation;
+                curLayer[i] += lastSigmoidedActivation * connectionWeight;
             }
         });
     });
     q.wait();
 }
 
-inline void train() {
-    randomParamaterInit(bias1, l1Size, 1, q);
-    randomParamaterInit(bias2, l2Size, 2, q);
-    randomParamaterInit(biasOut, lOutSize, 3, q);
-    randomParamaterInit(weightIn, lInSize * l1Size, 4, q);
-    randomParamaterInit(weight1, l1Size * l2Size, 5, q);
-    randomParamaterInit(weight2, l2Size * lOutSize, 6, q);
-    q.wait();
-
+inline void forwardPropogate() {
     sigmoidLayer(activationIn, sigmoidedIn, lInSize);
     forwardPropogateLayer(sigmoidedIn, lInSize, weightIn, bias1, activation1, l1Size);
     sigmoidLayer(activation1, sigmoided1, l1Size);
@@ -97,6 +100,56 @@ inline void train() {
     sigmoidLayer(activation2, sigmoided2, l2Size);
     forwardPropogateLayer(sigmoided2, l2Size, weight2, biasOut, activationOut, lOutSize);
     sigmoidLayer(activationOut, sigmoidedOut, lOutSize);
+}
+
+inline void train() {
+    vector<vector<vector<float>>> images(10, vector<vector<float>>(batchCount, vector<float>(784)));
+    for (int i = 0; i < 10; i++) {
+        int curCount = 0;
+        for (const auto& entry : directory_iterator("trainingSet\\" + to_string(i))) {
+            int width, height, channels;
+            unsigned char* data = stbi_load(entry.path().string().c_str(), &width, &height, &channels, 1);
+            if (entry.path().string() == "trainingSet\\0\\img_1.jpg") {
+                for (int x = 0; x < width; x++) {
+                    for (int y = 0; y < height; y++) {
+                        float value = data[x * width + y];
+                        value /= 255;
+                        images[i][curCount][x * width + y] = value;
+                    }
+                }
+            }
+            stbi_image_free(data);
+            curCount++;
+            if (curCount == batchCount) break;
+        }
+    }
+
+    randomParamaterInit(bias1, l1Size, 1, q, true);
+    randomParamaterInit(bias2, l2Size, 2, q, true);
+    randomParamaterInit(biasOut, lOutSize, 3, q, true);
+    randomParamaterInit(weightIn, lInSize * l1Size, 4, q, false);
+    randomParamaterInit(weight1, l1Size * l2Size, 5, q, false);
+    randomParamaterInit(weight2, l2Size * lOutSize, 6, q, false);
+    q.wait();
+    
+    forwardPropogate();
+    float sigmoidedOutHost[lOutSize];
+    q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float));
+    q.wait();
+    for (int i = 0; i < lOutSize; i++) cout << sigmoidedOutHost[i] << " ";
+    cout << "\n-----------\n";
+    for (int batchID = 0; batchID < 1; batchID++) {
+        for (int i = 0; i < 10; i++) {
+            imageActivationInit(activationIn, lInSize, q);
+            
+            forwardPropogate();
+            float sigmoidedOutHost[lOutSize];
+            q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float));
+            q.wait();
+            for (int i = 0; i < lOutSize; i++) cout << sigmoidedOutHost[i] << " ";
+            cout << "\n-----------\n";
+        }
+    }
 }
 
 inline void test() {
@@ -131,7 +184,7 @@ int main() {
     weightIn = malloc_device<float>(lInSize * l1Size, q);
     weight1 = malloc_device<float>(l1Size * l2Size, q);
     weight2 = malloc_device<float>(l2Size * lOutSize, q);
-    activationIn = malloc_shared<float>(lInSize, q); // This is shared, to allow for the host to feed in image data, while being accessed in the kernel
+    activationIn = malloc_device<float>(lInSize, q);
     activation1 = malloc_device<float>(l1Size, q);
     activation2 = malloc_device<float>(l2Size, q);
     activationOut = malloc_device<float>(lOutSize, q);
@@ -139,7 +192,7 @@ int main() {
     sigmoided1 = malloc_device<float>(l1Size, q);
     sigmoided2 = malloc_device<float>(l2Size, q);
     sigmoidedOut = malloc_shared<float>(lOutSize, q); // This is shared, so the data can be retrieved from the device to be read when testing
-
+    
     if (training) train();
     else test();
     
