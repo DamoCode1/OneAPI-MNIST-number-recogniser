@@ -7,8 +7,9 @@ Disclaimer!:
 
 An MNIST number recognition created with Intel's OneAPI, compatible with Intel Arc GPUs, and potentially other devices.
 
-Sources:
+Credits:
 - MNIST Dataset source: https://www.kaggle.com/datasets/amineipad/mnist-dataset/data
+- Library for reading images: https://github.com/nothings/stb/blob/master/stb_image.h
 - Idea and learnings for producing neural networks: 3Blue1Brown's YT playlist on neural networks
 
 This github serves as a personal learning project, to create a concrete understanding of a simple artificial neural network (ANN), and the connection between the ML algorithm and parallel GPU compute.
