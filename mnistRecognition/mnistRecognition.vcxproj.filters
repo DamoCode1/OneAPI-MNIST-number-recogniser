@@ -15,8 +15,11 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="$projectname$.cpp">
+    <ClCompile Include="mnistRecognition.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Text Include="paramaters.txt" />
   </ItemGroup>
 </Project>
