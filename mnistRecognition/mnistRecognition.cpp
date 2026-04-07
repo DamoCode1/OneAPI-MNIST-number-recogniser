@@ -30,6 +30,14 @@ float* biasOut;
 float* weightIn;
 float* weight1;
 float* weight2;
+float* activationIn;
+float* activation1;
+float* activation2;
+float* activationOut;
+float* sigmoidedIn;
+float* sigmoided1;
+float* sigmoided2;
+float* sigmoidedOut;
 bool training;
 
 // ChatGPT made a device-based random value generator, which is applied over a list of values. A unique randID is also inputed, for variance over lists.
@@ -50,6 +58,29 @@ inline void filedParamaterInit(float* paramaters, float* paramatersRead, int siz
     });
 }
 
+inline void sigmoidLayer(float* activationLayer, float* sigmoidLayer, int size) {
+    q.submit([&](handler& h) {
+        h.parallel_for(range<1>(size), [=](id<1> i) {
+            sigmoidLayer[i] = 1 / (1 + std::exp(-activationLayer[i]));
+        });
+    });
+    q.wait();
+}
+
+inline void forwardPropogateLayer(float* prevSigmoidedLayer, int prevSize, float* weights, float* biases, float* curLayer, int curSize) {
+    q.submit([&](handler& h) {
+        h.parallel_for(range<1>(curSize), [=](id<1> i) {
+            curLayer[i] = biases[i];
+            for (int j = 0; j < prevSize; j++) {
+                float lastSigmoidedActivation = prevSigmoidedLayer[j];
+                float connectionWeight = weights[i * prevSize + j];
+                curLayer[i] += lastSigmoidedActivation;
+            }
+        });
+    });
+    q.wait();
+}
+
 inline void train() {
     randomParamaterInit(bias1, l1Size, 1, q);
     randomParamaterInit(bias2, l2Size, 2, q);
@@ -58,6 +89,14 @@ inline void train() {
     randomParamaterInit(weight1, l1Size * l2Size, 5, q);
     randomParamaterInit(weight2, l2Size * lOutSize, 6, q);
     q.wait();
+
+    sigmoidLayer(activationIn, sigmoidedIn, lInSize);
+    forwardPropogateLayer(sigmoidedIn, lInSize, weightIn, bias1, activation1, l1Size);
+    sigmoidLayer(activation1, sigmoided1, l1Size);
+    forwardPropogateLayer(sigmoided1, l1Size, weight1, bias2, activation2, l2Size);
+    sigmoidLayer(activation2, sigmoided2, l2Size);
+    forwardPropogateLayer(sigmoided2, l2Size, weight2, biasOut, activationOut, lOutSize);
+    sigmoidLayer(activationOut, sigmoidedOut, lOutSize);
 }
 
 inline void test() {
@@ -92,19 +131,39 @@ int main() {
     weightIn = malloc_device<float>(lInSize * l1Size, q);
     weight1 = malloc_device<float>(l1Size * l2Size, q);
     weight2 = malloc_device<float>(l2Size * lOutSize, q);
+    activationIn = malloc_shared<float>(lInSize, q); // This is shared, to allow for the host to feed in image data, while being accessed in the kernel
+    activation1 = malloc_device<float>(l1Size, q);
+    activation2 = malloc_device<float>(l2Size, q);
+    activationOut = malloc_device<float>(lOutSize, q);
+    sigmoidedIn = malloc_device<float>(lInSize, q);
+    sigmoided1 = malloc_device<float>(l1Size, q);
+    sigmoided2 = malloc_device<float>(l2Size, q);
+    sigmoidedOut = malloc_shared<float>(lOutSize, q); // This is shared, so the data can be retrieved from the device to be read when testing
 
     if (training) train();
     else test();
     
-    float bias1Host[l1Size], bias2Host[l2Size], biasOutHost[lOutSize], weightInHost[lInSize * l1Size], weight1Host[l1Size * l2Size], weight2Host[l2Size * lOutSize];
+    float bias1Host[l1Size], bias2Host[l2Size], biasOutHost[lOutSize], 
+        weightInHost[lInSize * l1Size], weight1Host[l1Size * l2Size], weight2Host[l2Size * lOutSize], 
+        activationInHost[lInSize], activation1Host[l1Size], activation2Host[l2Size], activationOutHost[lOutSize],
+        sigmoidedInHost[lInSize], sigmoided1Host[l1Size], sigmoided2Host[l2Size], sigmoidedOutHost[lOutSize];
     q.memcpy(bias1Host, bias1, l1Size * sizeof(float));
     q.memcpy(bias2Host, bias2, l2Size * sizeof(float));
     q.memcpy(biasOutHost, biasOut, lOutSize * sizeof(float));
     q.memcpy(weightInHost, weightIn, lInSize * l1Size * sizeof(float));
     q.memcpy(weight1Host, weight1, l1Size * l2Size * sizeof(float));
     q.memcpy(weight2Host, weight2, l2Size * lOutSize * sizeof(float));
+    q.memcpy(activationInHost, activationIn, lInSize * sizeof(float));
+    q.memcpy(activation1Host, activation1, l1Size * sizeof(float));
+    q.memcpy(activation2Host, activation2, l2Size * sizeof(float));
+    q.memcpy(activationOutHost, activationOut, lOutSize * sizeof(float));
+    q.memcpy(sigmoidedInHost, sigmoidedIn, lInSize * sizeof(float));
+    q.memcpy(sigmoided1Host, sigmoided1, l1Size * sizeof(float));
+    q.memcpy(sigmoided2Host, sigmoided2, l2Size * sizeof(float));
+    q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float));
     q.wait();
 
+    /*
     for (int i = 0; i < l1Size; i++) cout << bias1Host[i] << " ";
     cout << "\n";
     for (int i = 0; i < l2Size; i++) cout << bias2Host[i] << " ";
@@ -117,14 +176,31 @@ int main() {
     cout << "\n";
     for (int i = 0; i < l2Size * lOutSize; i++) cout << weight2Host[i] << " ";
     cout << "\n";
+    */
+    for (int i = 0; i < lInSize; i++) cout << activationInHost[i] << " ";
+    cout << "\n-----------\n";
+    for (int i = 0; i < l1Size; i++) cout << activation1Host[i] << " ";
+    cout << "\n-----------\n";
+    for (int i = 0; i < l2Size; i++) cout << activation2Host[i] << " ";
+    cout << "\n-----------\n";
+    for (int i = 0; i < lOutSize; i++) cout << activationOutHost[i] << " ";
+    cout << "\n-----------\n";
+    for (int i = 0; i < lInSize; i++) cout << sigmoidedInHost[i] << " ";
+    cout << "\n-----------\n";
+    for (int i = 0; i < l1Size; i++) cout << sigmoided1Host[i] << " ";
+    cout << "\n-----------\n";
+    for (int i = 0; i < l2Size; i++) cout << sigmoided2Host[i] << " ";
+    cout << "\n-----------\n";
+    for (int i = 0; i < lOutSize; i++) cout << sigmoidedOutHost[i] << " ";
+    cout << "\n-----------\n";
 
     if (training) {
         ofstream paramOut("paramaters.txt");
-        for (float i : bias1Host) paramOut << i;
-        for (float i : bias2Host) paramOut << i;
-        for (float i : biasOutHost) paramOut << i;
-        for (float i : weightInHost) paramOut << i;
-        for (float i : weight1Host) paramOut << i;
-        for (float i : weight2Host) paramOut << i;
+        for (float i : bias1Host) paramOut << i << " ";
+        for (float i : bias2Host) paramOut << i << " ";
+        for (float i : biasOutHost) paramOut << i << " ";
+        for (float i : weightInHost) paramOut << i << " ";
+        for (float i : weight1Host) paramOut << i << " ";
+        for (float i : weight2Host) paramOut << i << " ";
     }
 }
