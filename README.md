@@ -2,8 +2,8 @@
 
 Disclaimer!:
 - Intel oneAPI DPC++ Compiler and libraries are licensed under the MIT License. 
-- This repository contains user code that is licensed separately.
-- This repository is still in development
+- This project contains code, data, and concepts that is licensed separately from this project.
+- This project is still in development
 
 An MNIST number recognition created with Intel's OneAPI, compatible with Intel Arc GPUs, and potentially other devices.
 
