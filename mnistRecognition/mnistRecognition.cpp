@@ -27,6 +27,7 @@ const int lInSize = 784, l1Size = 16, l2Size = 16, lOutSize = 10;
 const int batchCount = 3795, epochcount = 10;
 
 queue q;
+float* loss;
 float* bias1;
 float* bias2;
 float* biasOut;
@@ -53,14 +54,6 @@ inline void randomParamaterInit(float* paramaters, int size, int randID, queue& 
     });
 }
 
-inline void imageActivationInit(float* activations, int size, queue& q) {
-    q.submit([&](handler& h) {
-        h.parallel_for(range<1>(size), [=](id<1> i) {
-            activations[i] = 10000;
-        });
-    });
-}
-
 inline void filedParamaterInit(float* paramaters, float* paramatersRead, int size, queue& q) {
     q.submit([&](handler& h) {
         h.parallel_for(range<1>(size), [=](id<1> i) {
@@ -72,13 +65,13 @@ inline void filedParamaterInit(float* paramaters, float* paramatersRead, int siz
 inline void sigmoidLayer(float* activationLayer, float* sigmoidLayer, int size) {
     q.submit([&](handler& h) {
         h.parallel_for(range<1>(size), [=](id<1> i) {
-            sigmoidLayer[i] = 1 / (1 + std::exp(-activationLayer[i]));
+            sigmoidLayer[i] = 1 / (1 + sycl::exp(-activationLayer[i]));
         });
-    });
-    q.wait();
+    }).wait();
 }
 
 inline void forwardPropogateLayer(float* prevSigmoidedLayer, int prevSize, float* weights, float* biases, float* curLayer, int curSize) {
+    q.memset(loss, 0, sizeof(float)).wait();
     q.submit([&](handler& h) {
         h.parallel_for(range<1>(curSize), [=](id<1> i) {
             curLayer[i] = biases[i];
@@ -88,8 +81,20 @@ inline void forwardPropogateLayer(float* prevSigmoidedLayer, int prevSize, float
                 curLayer[i] += lastSigmoidedActivation * connectionWeight;
             }
         });
-    });
-    q.wait();
+    }).wait();
+}
+
+inline void computeLoss(float* lossVal, float* outputLayer, int layerSize, int targetNumber) {
+    q.submit([&](handler& h) {
+        local_accessor<float, 1> lossSum(range<1>(1), h);
+        h.parallel_for(range<1>(layerSize), [=](id<1> i) {
+            float expectedActivation = (i == targetNumber) ? 1 : 0;
+            float mse = sycl::pow(expectedActivation - outputLayer[i], 2);
+            //Atomic prevents incorrect sumation for parallel, relaxed means can be in any order, on device memory globally
+            atomic_ref<float, sycl::memory_order::relaxed, memory_scope::device, access::address_space::global_space> atomicSum(*lossVal);
+            atomicSum.fetch_add(mse);
+        });
+    }).wait();
 }
 
 inline void forwardPropogate() {
@@ -103,24 +108,23 @@ inline void forwardPropogate() {
 }
 
 inline void train() {
-    vector<vector<vector<float>>> images(10, vector<vector<float>>(batchCount, vector<float>(784)));
+    vector<vector<float*>> images(10, vector<float*>(batchCount));
     for (int i = 0; i < 10; i++) {
-        int curCount = 0;
+        int curBatch = 0;
         for (const auto& entry : directory_iterator("trainingSet\\" + to_string(i))) {
             int width, height, channels;
             unsigned char* data = stbi_load(entry.path().string().c_str(), &width, &height, &channels, 1);
-            if (entry.path().string() == "trainingSet\\0\\img_1.jpg") {
-                for (int x = 0; x < width; x++) {
-                    for (int y = 0; y < height; y++) {
-                        float value = data[x * width + y];
-                        value /= 255;
-                        images[i][curCount][x * width + y] = value;
-                    }
+            images[i][curBatch] = new float[784];
+            for (int x = 0; x < width; x++) {
+                for (int y = 0; y < height; y++) {
+                    float value = data[x * width + y];
+                    value /= 255;
+                    images[i][curBatch][x * width + y] = value;
                 }
             }
             stbi_image_free(data);
-            curCount++;
-            if (curCount == batchCount) break;
+            curBatch++;
+            if (curBatch == batchCount) break;
         }
     }
 
@@ -133,20 +137,27 @@ inline void train() {
     q.wait();
     
     forwardPropogate();
-    float sigmoidedOutHost[lOutSize];
+    computeLoss(loss, sigmoidedOut, lOutSize, 0);
+    float sigmoidedOutHost[lOutSize], lossHost[1];
     q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float));
+    q.memcpy(lossHost, loss, sizeof(float));
     q.wait();
     for (int i = 0; i < lOutSize; i++) cout << sigmoidedOutHost[i] << " ";
+    cout << "\nLoss = " << lossHost[0];
     cout << "\n-----------\n";
+
     for (int batchID = 0; batchID < 1; batchID++) {
         for (int i = 0; i < 10; i++) {
-            imageActivationInit(activationIn, lInSize, q);
+            q.memcpy(activationIn, images[i][batchID], lInSize * sizeof(float)).wait();
             
             forwardPropogate();
-            float sigmoidedOutHost[lOutSize];
+            computeLoss(loss, sigmoidedOut, lOutSize, i);
+            //float sigmoidedOutHost[lOutSize], lossHost[1];
             q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float));
+            q.memcpy(lossHost, loss, sizeof(float));
             q.wait();
             for (int i = 0; i < lOutSize; i++) cout << sigmoidedOutHost[i] << " ";
+            cout << "\nLoss = " << lossHost[0];
             cout << "\n-----------\n";
         }
     }
@@ -178,6 +189,7 @@ int main() {
     cin >> training;
     
     // Allocates memory to store paramaters
+    loss = malloc_device<float>(1, q);
     bias1 = malloc_device<float>(l1Size, q);
     bias2 = malloc_device<float>(l2Size, q);
     biasOut = malloc_device<float>(lOutSize, q);
@@ -191,7 +203,7 @@ int main() {
     sigmoidedIn = malloc_device<float>(lInSize, q);
     sigmoided1 = malloc_device<float>(l1Size, q);
     sigmoided2 = malloc_device<float>(l2Size, q);
-    sigmoidedOut = malloc_shared<float>(lOutSize, q); // This is shared, so the data can be retrieved from the device to be read when testing
+    sigmoidedOut = malloc_device<float>(lOutSize, q);
     
     if (training) train();
     else test();
@@ -215,37 +227,6 @@ int main() {
     q.memcpy(sigmoided2Host, sigmoided2, l2Size * sizeof(float));
     q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float));
     q.wait();
-
-    /*
-    for (int i = 0; i < l1Size; i++) cout << bias1Host[i] << " ";
-    cout << "\n";
-    for (int i = 0; i < l2Size; i++) cout << bias2Host[i] << " ";
-    cout << "\n";
-    for (int i = 0; i < lOutSize; i++) cout << biasOutHost[i] << " ";
-    cout << "\n";
-    for (int i = 0; i < lInSize * l1Size; i++) cout << weightInHost[i] << " ";
-    cout << "\n";
-    for (int i = 0; i < l1Size * l2Size; i++) cout << weight1Host[i] << " ";
-    cout << "\n";
-    for (int i = 0; i < l2Size * lOutSize; i++) cout << weight2Host[i] << " ";
-    cout << "\n";
-    */
-    for (int i = 0; i < lInSize; i++) cout << activationInHost[i] << " ";
-    cout << "\n-----------\n";
-    for (int i = 0; i < l1Size; i++) cout << activation1Host[i] << " ";
-    cout << "\n-----------\n";
-    for (int i = 0; i < l2Size; i++) cout << activation2Host[i] << " ";
-    cout << "\n-----------\n";
-    for (int i = 0; i < lOutSize; i++) cout << activationOutHost[i] << " ";
-    cout << "\n-----------\n";
-    for (int i = 0; i < lInSize; i++) cout << sigmoidedInHost[i] << " ";
-    cout << "\n-----------\n";
-    for (int i = 0; i < l1Size; i++) cout << sigmoided1Host[i] << " ";
-    cout << "\n-----------\n";
-    for (int i = 0; i < l2Size; i++) cout << sigmoided2Host[i] << " ";
-    cout << "\n-----------\n";
-    for (int i = 0; i < lOutSize; i++) cout << sigmoidedOutHost[i] << " ";
-    cout << "\n-----------\n";
 
     if (training) {
         ofstream paramOut("paramaters.txt");
