@@ -5,8 +5,6 @@ Disclaimer!:
 - This project contains code, data, and concepts that is licensed separately from this project.
 - This project is still in development
 
-An MNIST number recognition created with Intel's OneAPI, compatible with Intel Arc GPUs, and potentially other devices.
-
 Credits:
 - MNIST Dataset source: https://www.kaggle.com/datasets/amineipad/mnist-dataset/data
 - Library for reading images: https://github.com/nothings/stb/blob/master/stb_image.h
