@@ -26,6 +26,8 @@ using namespace filesystem;
 const int lInSize = 784, l1Size = 16, l2Size = 16, lOutSize = 10;
 const int batchCount = 3795, epochcount = 10;
 
+//NOTE TO SELF: 1 epoch of 3795 batches of 10 took ~3 minutes = ~21 batches per second = ~210 images per second = ~4.7 milliseconds per image
+
 queue q;
 float* loss;
 float* bias1;
@@ -42,7 +44,7 @@ float* sigmoidedIn;
 float* sigmoided1;
 float* sigmoided2;
 float* sigmoidedOut;
-bool training;
+bool training, debugging;
 
 // ChatGPT made a device-based random value generator, which is applied over a list of values. A unique randID is also inputed, for variance over lists.
 inline void randomParamaterInit(float* paramaters, int size, int randID, queue& q, bool isBias) {
@@ -50,14 +52,6 @@ inline void randomParamaterInit(float* paramaters, int size, int randID, queue& 
         h.parallel_for(range<1>(size), [=](id<1> i) {
             float randVal = float(((i + randID * 10000000) ^ 0xA3B1C2D3) * 1664525 + 1013904223 & 0xFFFFFF) / float(0xFFFFFF); // Random value between 0 and 1
             paramaters[i] = randVal * 2 - 1;
-        });
-    });
-}
-
-inline void filedParamaterInit(float* paramaters, float* paramatersRead, int size, queue& q) {
-    q.submit([&](handler& h) {
-        h.parallel_for(range<1>(size), [=](id<1> i) {
-            paramaters[i] = paramatersRead[i];
         });
     });
 }
@@ -138,29 +132,53 @@ inline void train() {
     
     forwardPropogate();
     computeLoss(loss, sigmoidedOut, lOutSize, 0);
-    float sigmoidedOutHost[lOutSize], lossHost[1];
-    q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float));
-    q.memcpy(lossHost, loss, sizeof(float));
-    q.wait();
-    for (int i = 0; i < lOutSize; i++) cout << sigmoidedOutHost[i] << " ";
-    cout << "\nLoss = " << lossHost[0];
-    cout << "\n-----------\n";
+    if (debugging) {
+        float sigmoidedOutHost[lOutSize], lossHost[1];
+        q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float));
+        q.memcpy(lossHost, loss, sizeof(float));
+        q.wait();
+        for (int i = 0; i < lOutSize; i++) cout << sigmoidedOutHost[i] << " ";
+        cout << "\nLoss = " << lossHost[0];
+        cout << "\n-----------\n";
+    }
 
-    for (int batchID = 0; batchID < 1; batchID++) {
+    for (int batchID = 0; batchID < ((debugging) ? 1 : batchCount); batchID++) {
         for (int i = 0; i < 10; i++) {
             q.memcpy(activationIn, images[i][batchID], lInSize * sizeof(float)).wait();
             
             forwardPropogate();
             computeLoss(loss, sigmoidedOut, lOutSize, i);
-            //float sigmoidedOutHost[lOutSize], lossHost[1];
-            q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float));
-            q.memcpy(lossHost, loss, sizeof(float));
-            q.wait();
-            for (int i = 0; i < lOutSize; i++) cout << sigmoidedOutHost[i] << " ";
-            cout << "\nLoss = " << lossHost[0];
-            cout << "\n-----------\n";
+            if (debugging) {
+                float sigmoidedOutHost[lOutSize], lossHost[1];
+                q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float));
+                q.memcpy(lossHost, loss, sizeof(float));
+                q.wait();
+                for (int i = 0; i < lOutSize; i++) cout << sigmoidedOutHost[i] << " ";
+                cout << "\nLoss = " << lossHost[0];
+                cout << "\n-----------\n";
+            }
         }
     }
+
+    //Collects paramaters from device
+    float bias1Host[l1Size], bias2Host[l2Size], biasOutHost[lOutSize],
+        weightInHost[lInSize * l1Size], weight1Host[l1Size * l2Size], weight2Host[l2Size * lOutSize];
+    q.memcpy(bias1Host, bias1, l1Size * sizeof(float));
+    q.memcpy(bias2Host, bias2, l2Size * sizeof(float));
+    q.memcpy(biasOutHost, biasOut, lOutSize * sizeof(float));
+    q.memcpy(weightInHost, weightIn, lInSize * l1Size * sizeof(float));
+    q.memcpy(weight1Host, weight1, l1Size * l2Size * sizeof(float));
+    q.memcpy(weight2Host, weight2, l2Size * lOutSize * sizeof(float));
+    q.wait();
+    // Stores the collected paramaters in a text file, to be read for testing
+    ofstream paramOut("paramaters.txt");
+    for (float i : bias1Host) paramOut << i << " ";
+    for (float i : bias2Host) paramOut << i << " ";
+    for (float i : biasOutHost) paramOut << i << " ";
+    for (float i : weightInHost) paramOut << i << " ";
+    for (float i : weight1Host) paramOut << i << " ";
+    for (float i : weight2Host) paramOut << i << " ";
+    cout << "Training Completed!\n";
 }
 
 inline void test() {
@@ -187,6 +205,8 @@ int main() {
     cout << q.get_device().get_info<info::device::name>() << "\n";
     cout << "(1 = Training, 0 = Testing): ";
     cin >> training;
+    cout << "(1 = Debugging, 0 = Not Debugging): ";
+    cin >> debugging;
     
     // Allocates memory to store paramaters
     loss = malloc_device<float>(1, q);
@@ -207,34 +227,4 @@ int main() {
     
     if (training) train();
     else test();
-    
-    float bias1Host[l1Size], bias2Host[l2Size], biasOutHost[lOutSize], 
-        weightInHost[lInSize * l1Size], weight1Host[l1Size * l2Size], weight2Host[l2Size * lOutSize], 
-        activationInHost[lInSize], activation1Host[l1Size], activation2Host[l2Size], activationOutHost[lOutSize],
-        sigmoidedInHost[lInSize], sigmoided1Host[l1Size], sigmoided2Host[l2Size], sigmoidedOutHost[lOutSize];
-    q.memcpy(bias1Host, bias1, l1Size * sizeof(float));
-    q.memcpy(bias2Host, bias2, l2Size * sizeof(float));
-    q.memcpy(biasOutHost, biasOut, lOutSize * sizeof(float));
-    q.memcpy(weightInHost, weightIn, lInSize * l1Size * sizeof(float));
-    q.memcpy(weight1Host, weight1, l1Size * l2Size * sizeof(float));
-    q.memcpy(weight2Host, weight2, l2Size * lOutSize * sizeof(float));
-    q.memcpy(activationInHost, activationIn, lInSize * sizeof(float));
-    q.memcpy(activation1Host, activation1, l1Size * sizeof(float));
-    q.memcpy(activation2Host, activation2, l2Size * sizeof(float));
-    q.memcpy(activationOutHost, activationOut, lOutSize * sizeof(float));
-    q.memcpy(sigmoidedInHost, sigmoidedIn, lInSize * sizeof(float));
-    q.memcpy(sigmoided1Host, sigmoided1, l1Size * sizeof(float));
-    q.memcpy(sigmoided2Host, sigmoided2, l2Size * sizeof(float));
-    q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float));
-    q.wait();
-
-    if (training) {
-        ofstream paramOut("paramaters.txt");
-        for (float i : bias1Host) paramOut << i << " ";
-        for (float i : bias2Host) paramOut << i << " ";
-        for (float i : biasOutHost) paramOut << i << " ";
-        for (float i : weightInHost) paramOut << i << " ";
-        for (float i : weight1Host) paramOut << i << " ";
-        for (float i : weight2Host) paramOut << i << " ";
-    }
 }
