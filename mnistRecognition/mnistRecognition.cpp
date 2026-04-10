@@ -6,7 +6,7 @@
 // SPDX-License-Identifier: MIT
 // =============================================================
 
-//Initialisation
+// INITIALISATION --------------------------------------------------------------------------------------
 #include <sycl/sycl.hpp>
 #include <iostream>
 #include <filesystem>
@@ -16,35 +16,42 @@ using namespace sycl;
 using namespace std;
 using namespace filesystem;
 
-/*
-* The neural net is fixed at 4 layers(including input and output).
-* The input neuron count should be fixed for 28x28 images, and output neuron count should be fixed for numbers 0->9.
-* However, the neuron count of the intermediate layers can be chosen freely.
-* Furthermore, each batch contains each of the 10 numbers, and the amount of batches can be lowered.
-* The amount of epochs can be chosen freely.
+/* 
+    Context and instructions:
+        The neural net is fixed at 4 layers(including input and output).
+        The input neuron count should be fixed for 28x28 images, and output neuron count should be fixed for numbers 0->9.
+        However, the neuron count of the intermediate layers can be chosen freely.
+        Furthermore, each batch contains each of the 10 numbers, and the amount of batches can be lowered.
+        The amount of epochs can be chosen freely.
 */
 const int lInSize = 784, l1Size = 16, l2Size = 16, lOutSize = 10;
-const int batchCount = 3795, epochcount = 10;
+const int batchCount = 3795, epochCount = 1;
+const float initialLearningRate = 1, finishLearningRate = 0.01;
+
+// Do not adjust anything below
+bool training, debugging;
+const float learningRateDecay = std::pow(finishLearningRate / initialLearningRate, 1.0f / (batchCount * epochCount));
 
 //NOTE TO SELF: 1 epoch of 3795 batches of 10 took ~3 minutes = ~21 batches per second = ~210 images per second = ~4.7 milliseconds per image
 
+//GPU memory allocations
 queue q;
-float* loss;
-float* bias1;
-float* bias2;
-float* biasOut;
-float* weightIn;
-float* weight1;
-float* weight2;
-float* activationIn;
-float* activation1;
-float* activation2;
-float* activationOut;
-float* sigmoidedIn;
-float* sigmoided1;
-float* sigmoided2;
-float* sigmoidedOut;
-bool training, debugging;
+float *loss, *learningRate;
+
+float *bias1, *bias2, *biasOut;
+float *bias1Derivative, *bias2Derivative, *biasOutDerivative;
+float *bias1DerivativeSum, *bias2DerivativeSum, *biasOutDerivativeSum;
+
+float *weightIn, *weight1, *weight2;
+float *weightInDerivative, *weight1Derivative, *weight2Derivative;
+float *weightInDerivativeSum, *weight1DerivativeSum, *weight2DerivativeSum;
+
+float *activationIn, *activation1, *activation2, *activationOut;
+float *activationInDerivative, *activation1Derivative, *activation2Derivative, *activationOutDerivative;
+
+float *sigmoidedIn, *sigmoided1, *sigmoided2, *sigmoidedOut;
+float *sigmoidedInDerivative, *sigmoided1Derivative, *sigmoided2Derivative, *sigmoidedOutDerivative;
+
 
 // ChatGPT made a device-based random value generator, which is applied over a list of values. A unique randID is also inputed, for variance over lists.
 inline void randomParamaterInit(float* paramaters, int size, int randID, queue& q, bool isBias) {
@@ -56,6 +63,8 @@ inline void randomParamaterInit(float* paramaters, int size, int randID, queue& 
     });
 }
 
+// FORWARD PROPOGATION --------------------------------------------------------------------------------------
+// Calculate the layer of sigmoided activations
 inline void sigmoidLayer(float* activationLayer, float* sigmoidLayer, int size) {
     q.submit([&](handler& h) {
         h.parallel_for(range<1>(size), [=](id<1> i) {
@@ -64,6 +73,7 @@ inline void sigmoidLayer(float* activationLayer, float* sigmoidLayer, int size) 
     }).wait();
 }
 
+// Calculate unsigmoided activations of a layer, based on the previous layer and relevant paramaters
 inline void forwardPropogateLayer(float* prevSigmoidedLayer, int prevSize, float* weights, float* biases, float* curLayer, int curSize) {
     q.memset(loss, 0, sizeof(float)).wait();
     q.submit([&](handler& h) {
@@ -78,6 +88,7 @@ inline void forwardPropogateLayer(float* prevSigmoidedLayer, int prevSize, float
     }).wait();
 }
 
+// Calculate MSE of output layer compared to the expected output
 inline void computeLoss(float* lossVal, float* outputLayer, int layerSize, int targetNumber) {
     q.submit([&](handler& h) {
         local_accessor<float, 1> lossSum(range<1>(1), h);
@@ -91,6 +102,7 @@ inline void computeLoss(float* lossVal, float* outputLayer, int layerSize, int t
     }).wait();
 }
 
+// Run functions for forward propogation, to calculate activations of output layer
 inline void forwardPropogate() {
     sigmoidLayer(activationIn, sigmoidedIn, lInSize);
     forwardPropogateLayer(sigmoidedIn, lInSize, weightIn, bias1, activation1, l1Size);
@@ -101,7 +113,36 @@ inline void forwardPropogate() {
     sigmoidLayer(activationOut, sigmoidedOut, lOutSize);
 }
 
+// BACKWARD PROPOGATION + GRADIENT DESCENT --------------------------------------------------------------------------------------
+inline void initTo1(float* values, int listSize) {
+    q.submit([&](handler& h) {
+        h.parallel_for(range<1>(listSize), [=](id<1> i) {
+            values[i] = 1;
+        });
+    });
+}
+
+inline void adjustLearningRate(float* LR) {
+    const float decay = learningRateDecay;
+    q.submit([&](handler& h) {
+        h.single_task([=]() {
+            LR[0] = LR[0] * decay;
+        });
+    }).wait();
+}
+
+inline void backwardPropogate() {
+    
+}
+
+// TRAINING --------------------------------------------------------------------------------------
 inline void train() {
+    // Single-value for computing loss
+    loss = malloc_device<float>(1, q);
+    learningRate = malloc_device<float>(1, q);
+    q.memcpy(learningRate, &initialLearningRate, sizeof(float)).wait();
+
+    // Collect and store arrays of images
     vector<vector<float*>> images(10, vector<float*>(batchCount));
     for (int i = 0; i < 10; i++) {
         int curBatch = 0;
@@ -122,6 +163,7 @@ inline void train() {
         }
     }
 
+    // Initialise all paramaters randomly (MAYBE CHANGE FOR A BETTER ALTERNATIVE)
     randomParamaterInit(bias1, l1Size, 1, q, true);
     randomParamaterInit(bias2, l2Size, 2, q, true);
     randomParamaterInit(biasOut, lOutSize, 3, q, true);
@@ -130,6 +172,7 @@ inline void train() {
     randomParamaterInit(weight2, l2Size * lOutSize, 6, q, false);
     q.wait();
     
+    //Test forward propogation (TO REMOVE)
     forwardPropogate();
     computeLoss(loss, sigmoidedOut, lOutSize, 0);
     if (debugging) {
@@ -142,20 +185,23 @@ inline void train() {
         cout << "\n-----------\n";
     }
 
-    for (int batchID = 0; batchID < ((debugging) ? 1 : batchCount); batchID++) {
-        for (int i = 0; i < 10; i++) {
-            q.memcpy(activationIn, images[i][batchID], lInSize * sizeof(float)).wait();
-            
-            forwardPropogate();
-            computeLoss(loss, sigmoidedOut, lOutSize, i);
-            if (debugging) {
-                float sigmoidedOutHost[lOutSize], lossHost[1];
-                q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float));
-                q.memcpy(lossHost, loss, sizeof(float));
-                q.wait();
-                for (int i = 0; i < lOutSize; i++) cout << sigmoidedOutHost[i] << " ";
-                cout << "\nLoss = " << lossHost[0];
-                cout << "\n-----------\n";
+    for (int epoch = 0; epoch < epochCount; epoch++) {
+        for (int batchID = 0; batchID < ((debugging) ? 1 : batchCount); batchID++) {
+            for (int i = 0; i < 10; i++) {
+                q.memcpy(activationIn, images[i][batchID], lInSize * sizeof(float)).wait();
+
+                forwardPropogate();
+                computeLoss(loss, sigmoidedOut, lOutSize, i);
+                backwardPropogate();
+                if (debugging) {
+                    float sigmoidedOutHost[lOutSize], lossHost[1];
+                    q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float));
+                    q.memcpy(lossHost, loss, sizeof(float));
+                    q.wait();
+                    for (int i = 0; i < lOutSize; i++) cout << sigmoidedOutHost[i] << " ";
+                    cout << "\nLoss = " << lossHost[0];
+                    cout << "\n-----------\n";
+                }
             }
         }
     }
@@ -181,6 +227,7 @@ inline void train() {
     cout << "Training Completed!\n";
 }
 
+// TESTING --------------------------------------------------------------------------------------
 inline void test() {
     ifstream paramIn("paramaters.txt");
     if (!paramIn.is_open()) cerr << "Failed to link\n";
@@ -200,6 +247,8 @@ inline void test() {
     q.wait();
 }
 
+
+// INITIALISATION FUNCTION --------------------------------------------------------------------------------------
 int main() {
     q = queue(default_selector_v);
     cout << q.get_device().get_info<info::device::name>() << "\n";
@@ -208,8 +257,7 @@ int main() {
     cout << "(1 = Debugging, 0 = Not Debugging): ";
     cin >> debugging;
     
-    // Allocates memory to store paramaters
-    loss = malloc_device<float>(1, q);
+    // Allocates memory for activations (sigmoided/unprocessed), and paramaters (weights/biases). See other memory allocations specific to training in the train function.
     bias1 = malloc_device<float>(l1Size, q);
     bias2 = malloc_device<float>(l2Size, q);
     biasOut = malloc_device<float>(lOutSize, q);
