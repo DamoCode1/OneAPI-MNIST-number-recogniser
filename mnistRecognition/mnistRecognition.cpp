@@ -19,7 +19,7 @@ using namespace filesystem;
 /* 
     Context and instructions:
         The neural net is fixed at 4 layers(including input and output).
-        The input neuron count should be fixed for 28x28 images, and output neuron count should be fixed for numbers 0->9.
+        The input neuron count should be fixed for 28x28 MNIST images, and output neuron count should be fixed for numbers 0->9.
         However, the neuron count of the intermediate layers can be chosen freely.
         Furthermore, each batch contains each of the 10 numbers, and the amount of batches can be lowered.
         The amount of epochs can be chosen freely.
@@ -37,6 +37,7 @@ const float learningRateDecay = std::pow(finishLearningRate / initialLearningRat
 //GPU memory allocations
 queue q;
 float *loss, *learningRate;
+float *trainingImages;
 
 float *bias1, *bias2, *biasOut;
 float *bias1Derivative, *bias2Derivative, *biasOutDerivative;
@@ -63,6 +64,14 @@ inline void randomParamaterInit(float* paramaters, int size, int randID, queue& 
     });
 }
 
+inline void storeImage(float* images, unsigned char* data, int width, int height, int number, int curBatch) {
+    q.submit([&](handler& h) {
+        h.parallel_for(range<1>(width * height), [=](id<1> i) {
+            images[((number * 10) + curBatch) * batchCount + i] = data[i] / 255.0f;
+        });
+    });
+}
+
 // FORWARD PROPOGATION --------------------------------------------------------------------------------------
 // Calculate the layer of sigmoided activations
 inline void sigmoidLayer(float* activationLayer, float* sigmoidLayer, int size) {
@@ -75,7 +84,6 @@ inline void sigmoidLayer(float* activationLayer, float* sigmoidLayer, int size) 
 
 // Calculate unsigmoided activations of a layer, based on the previous layer and relevant paramaters
 inline void forwardPropogateLayer(float* prevSigmoidedLayer, int prevSize, float* weights, float* biases, float* curLayer, int curSize) {
-    q.memset(loss, 0, sizeof(float)).wait();
     q.submit([&](handler& h) {
         h.parallel_for(range<1>(curSize), [=](id<1> i) {
             curLayer[i] = biases[i];
@@ -90,6 +98,7 @@ inline void forwardPropogateLayer(float* prevSigmoidedLayer, int prevSize, float
 
 // Calculate MSE of output layer compared to the expected output
 inline void computeLoss(float* lossVal, float* outputLayer, int layerSize, int targetNumber) {
+    q.memset(lossVal, 0, sizeof(float)).wait();
     q.submit([&](handler& h) {
         local_accessor<float, 1> lossSum(range<1>(1), h);
         h.parallel_for(range<1>(layerSize), [=](id<1> i) {
@@ -141,27 +150,23 @@ inline void train() {
     loss = malloc_device<float>(1, q);
     learningRate = malloc_device<float>(1, q);
     q.memcpy(learningRate, &initialLearningRate, sizeof(float)).wait();
+    trainingImages = malloc_device<float>(10 * batchCount * lInSize, q);
 
     // Collect and store arrays of images
-    vector<vector<float*>> images(10, vector<float*>(batchCount));
+    float* images = new float[10 * batchCount * lInSize];
     for (int i = 0; i < 10; i++) {
         int curBatch = 0;
         for (const auto& entry : directory_iterator("trainingSet\\" + to_string(i))) {
             int width, height, channels;
             unsigned char* data = stbi_load(entry.path().string().c_str(), &width, &height, &channels, 1);
-            images[i][curBatch] = new float[784];
-            for (int x = 0; x < width; x++) {
-                for (int y = 0; y < height; y++) {
-                    float value = data[x * width + y];
-                    value /= 255;
-                    images[i][curBatch][x * width + y] = value;
-                }
-            }
+            float* destination = images + (i * batchCount + curBatch) * lInSize;
+            for (int x = 0; x < width * height; x++) destination[x] = data[x] / 255.0f;
             stbi_image_free(data);
             curBatch++;
             if (curBatch == batchCount) break;
         }
     }
+    q.memcpy(trainingImages, images, 10 * batchCount * lInSize * sizeof(float)).wait();
 
     // Initialise all paramaters randomly (MAYBE CHANGE FOR A BETTER ALTERNATIVE)
     randomParamaterInit(bias1, l1Size, 1, q, true);
@@ -188,7 +193,7 @@ inline void train() {
     for (int epoch = 0; epoch < epochCount; epoch++) {
         for (int batchID = 0; batchID < ((debugging) ? 1 : batchCount); batchID++) {
             for (int i = 0; i < 10; i++) {
-                q.memcpy(activationIn, images[i][batchID], lInSize * sizeof(float)).wait();
+                activationIn = trainingImages + (i * batchCount + batchID) * lInSize;
 
                 forwardPropogate();
                 computeLoss(loss, sigmoidedOut, lOutSize, i);
