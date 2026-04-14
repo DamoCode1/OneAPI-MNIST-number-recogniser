@@ -25,15 +25,15 @@ using namespace chrono;
         Furthermore, each batch contains each of the 10 numbers, and the amount of batches can be lowered.
         The amount of epochs can be chosen freely.
 */
-const int lInSize = 784, l1Size = 16, l2Size = 16, lOutSize = 10;
-const int batchCount = 3795, epochCount = 1;
-const float initialLearningRate = 1, finishLearningRate = 0.01;
+const int lInSize = 784, l1Size = 128, l2Size = 64, lOutSize = 10;
+const int batchCount = 3795, epochCount = 10;
+const float initialLearningRate = 0.1, finishLearningRate = 0.001;
 
 // Do not adjust anything below
 bool training, debugging, singleEpoch;
 const float learningRateDecay = std::pow(finishLearningRate / initialLearningRate, 1.0f / (batchCount * epochCount));
 
-//NOTE TO SELF for forward prop: 1 epoch of 3795 batches of 10 took ~113s = ~34 batches per second = ~336 images per second = ~2.98 milliseconds per image
+//NOTE TO SELF for training 10 epochs: 1 epoch of 3795 batches of 10 took ~126.2s = ~30 batches per second = ~301 images per second = ~3.33 milliseconds per image
 
 //GPU memory allocations
 queue q;
@@ -42,11 +42,9 @@ float *trainingImages;
 
 float *bias1, *bias2, *biasOut;
 float *bias1Derivative, *bias2Derivative, *biasOutDerivative;
-float *bias1DerivativeSum, *bias2DerivativeSum, *biasOutDerivativeSum;
 
 float *weightIn, *weight1, *weight2;
 float *weightInDerivative, *weight1Derivative, *weight2Derivative;
-float *weightInDerivativeSum, *weight1DerivativeSum, *weight2DerivativeSum;
 
 float *activationIn, *activation1, *activation2, *activationOut;
 // No activation derivative, as this is same as bias derivative
@@ -91,23 +89,6 @@ inline event forwardPropogateLayer(float* prevSigmoidedLayer, int prevSize, floa
     });
 }
 
-// Calculate MSE of output layer compared to the expected output
-inline event computeLoss(float* lossVal, float* outputLayer, int layerSize, int targetNumber, event forwardPropEvent) {
-    event setting = q.memset(lossVal, 0, sizeof(float));
-    return q.submit([&](handler& h) {
-        h.depends_on(forwardPropEvent);
-        h.depends_on(setting);
-        local_accessor<float, 1> lossSum(range<1>(1), h);
-        h.parallel_for(range<1>(layerSize), [=](id<1> i) {
-            float expectedActivation = (i == targetNumber) ? 1 : 0;
-            float mse = sycl::pow(expectedActivation - outputLayer[i], 2);
-            //Atomic prevents incorrect sumation for parallel, relaxed means can be in any order, on device memory globally
-            atomic_ref<float, sycl::memory_order::relaxed, memory_scope::device, access::address_space::global_space> atomicSum(*lossVal);
-            atomicSum.fetch_add(mse);
-        });
-    });
-}
-
 // Run functions for forward propogation, to calculate activations of output layer
 inline event forwardPropogate(int i) {
     event s1 = sigmoidLayer(activationIn + i * lInSize, sigmoidedIn + i * lInSize, lInSize, {});
@@ -130,11 +111,72 @@ inline void adjustLearningRate(float* LR) {
     }).wait();
 }
 
-inline void backwardPropogate(int i, event computeLossEvent) {
-    
+inline event deriveOutputSigmoidLayer(float* sigmoidOut, float* sigmoidOutDerivative, int expected, event forwardPropEvent) {
+    return q.submit([&](handler& h) {
+        h.depends_on(forwardPropEvent);
+        h.parallel_for(range<1>(lOutSize), [=](id<1> i) {
+            sigmoidOutDerivative[i] = 2 * (sigmoidOut[i] - ((i == expected) ? 1 : 0));
+        });
+    });
 }
 
-// PARAMATER CHANGE --------------------------------------------------------------------------------------
+inline event deriveBiases(float* sigmoided, float* biasDerivative, float* sigmoidedDerivative, int listSize, event sigmoidDeriveEvent) {
+    return q.submit([&](handler& h) {
+        h.depends_on(sigmoidDeriveEvent);
+        h.parallel_for(range<1>(listSize), [=](id<1> i) {
+            //biasDerivative[i] = sigmoidedDerivative[i] * sycl::exp(-activation[i]) / sycl::pow(1 + sycl::exp(-activation[i]), 2);
+            biasDerivative[i] = sigmoidedDerivative[i] * sigmoided[i] * (1 - sigmoided[i]);
+        });
+    });
+}
+
+inline void deriveWeights(float* prevSigmoided, float* biasDerivative, float* weightDerivative, int prevListSize, int listSize, event biasDeriveEvent) {
+    q.submit([&](handler& h) {
+        h.depends_on(biasDeriveEvent);
+        h.parallel_for(range<2>(prevListSize, listSize), [=](id<2> i) {
+            weightDerivative[i[1] * prevListSize + i[0]] = biasDerivative[i[1]] * prevSigmoided[i[0]];
+        });
+    });
+}
+
+inline event deriveSigmoid(float* prevSigmoided, float* biasDerivative, float* weight, float* prevSigmoidedDerivative, int prevListSize, int listSize, event biasDeriveEvent) {
+    return q.submit([&](handler& h) {
+        h.depends_on(biasDeriveEvent);
+        h.parallel_for(range<1>(prevListSize), [=](id<1> i) {
+            prevSigmoidedDerivative[i] = 0;
+            for (int j = 0; j < listSize; j++) {
+                prevSigmoidedDerivative[i] += biasDerivative[j] * weight[j * prevListSize + i];
+            }
+        });
+    });
+}
+
+inline void backwardPropogate(int i, event forwardPropEvent) {
+    event s4 = deriveOutputSigmoidLayer(sigmoidedOut + i * lOutSize, sigmoidedOutDerivative + i * lOutSize, i, forwardPropEvent);
+    event b4 = deriveBiases(sigmoidedOut + i * lOutSize, biasOutDerivative + i * lOutSize, sigmoidedOutDerivative + i * lOutSize, lOutSize, s4);
+    deriveWeights(sigmoided2 + i * l2Size, biasOutDerivative + i * lOutSize, weight2Derivative + i * l2Size * lOutSize, l2Size, lOutSize, b4);
+
+    event s3 = deriveSigmoid(sigmoided2 + i * l2Size, biasOutDerivative + i * lOutSize, weight2, sigmoided2Derivative + i * l2Size, l2Size, lOutSize, b4);
+    event b3 = deriveBiases(sigmoided2 + i * l2Size, bias2Derivative + i * l2Size, sigmoided2Derivative + i * l2Size, l2Size, s3);
+    deriveWeights(sigmoided1 + i * l1Size, bias2Derivative + i * l2Size, weight1Derivative + i * l1Size * l2Size, l1Size, l2Size, b3);
+
+    event s2 = deriveSigmoid(sigmoided1 + i * l1Size, bias2Derivative + i * l2Size, weight1, sigmoided1Derivative + i * l1Size, l1Size, l2Size, b3);
+    event b2 = deriveBiases(sigmoided1 + i * l1Size, bias1Derivative + i * l1Size, sigmoided1Derivative + i * l1Size, l1Size, s2);
+    deriveWeights(sigmoidedIn + i * lInSize, bias1Derivative + i * l1Size, weightInDerivative + i * lInSize * l1Size, lInSize, l1Size, b2);
+}
+
+inline void paramaterNegateDerivatives(float* paramaters, float* derivatives, float* LR, int listSize) {
+    q.submit([&](handler& h) {
+        h.parallel_for(range<1>(listSize), [=](id<1> i) {
+            for (int number = 0; number < 10; number++) {
+                // Not divided for average, cause learning rate will adjust anyway
+                paramaters[i] -= derivatives[number * listSize + i] * LR[0];
+            }
+        });
+    });
+}
+
+// DEBUG --------------------------------------------------------------------------------------
 inline void initTo1(float* values, int listSize) {
     q.submit([&](handler& h) {
         h.parallel_for(range<1>(listSize), [=](id<1> i) {
@@ -143,12 +185,25 @@ inline void initTo1(float* values, int listSize) {
     });
 }
 
-inline void paramaterSumDerivatives(float* paramaters, float* derivativeSums, float* LR, int listSize) {
+inline void initTo0(float* values, int listSize) {
     q.submit([&](handler& h) {
         h.parallel_for(range<1>(listSize), [=](id<1> i) {
-            paramaters[i] += derivativeSums[i] * LR[0];
+            values[i] = 0;
         });
     });
+}
+
+inline void computeLoss(float* lossVal, float* outputLayer, int layerSize, int targetNumber) {
+    q.memset(lossVal, 0, sizeof(float)).wait();
+    q.submit([&](handler& h) {
+        h.parallel_for(range<1>(layerSize), [=](id<1> i) {
+            float expectedActivation = (i == targetNumber) ? 1 : 0;
+            float mse = sycl::pow(expectedActivation - outputLayer[i], 2);
+            //Atomic prevents incorrect sumation for parallel, relaxed means can be in any order, on device memory globally
+            atomic_ref<float, sycl::memory_order::relaxed, memory_scope::device, access::address_space::global_space> atomicSum(*lossVal);
+            atomicSum.fetch_add(mse);
+        });
+    }).wait();
 }
 
 
@@ -175,12 +230,6 @@ inline void train() {
     sigmoided1Derivative = malloc_device<float>(10 * l1Size, q);
     sigmoided2Derivative = malloc_device<float>(10 * l2Size, q);
     sigmoidedOutDerivative = malloc_device<float>(10 * lOutSize, q);
-    bias1DerivativeSum = malloc_device<float>(l1Size, q);
-    bias2DerivativeSum = malloc_device<float>(l2Size, q);
-    biasOutDerivativeSum = malloc_device<float>(lOutSize, q);
-    weightInDerivativeSum = malloc_device<float>(lInSize * l1Size, q);
-    weight1DerivativeSum = malloc_device<float>(l1Size * l2Size, q);
-    weight2DerivativeSum = malloc_device<float>(l2Size * lOutSize, q);
     // Single-value for computing loss
     losses = malloc_device<float>(10, q);
     learningRate = malloc_device<float>(1, q);
@@ -220,44 +269,44 @@ inline void train() {
         float biasOutHost[lOutSize];
         q.memcpy(biasOutHost, biasOut, lOutSize * sizeof(float)).wait();
         for (int i = 0; i < lOutSize; i++) cout << biasOutHost[i] << " ";
-        cout << "\n-----------\n";
+        cout << " initial bias values\n-----------\n";
     }
     for (int epoch = 0; epoch < ((singleEpoch) ? 1 : epochCount); epoch++) {
         for (int batchID = 0; batchID < ((debugging) ? 1 : batchCount); batchID++) {
             activationIn = trainingImages + batchID * 10 * lInSize;
             for (int i = 0; i < 10; i++) {
-                auto event1 = forwardPropogate(i);
-                auto event2 = computeLoss(losses + i, sigmoidedOut + i *  lOutSize, lOutSize, i, event1);
-                backwardPropogate(i, event2);
+                auto forwardPropEvent = forwardPropogate(i);
+                backwardPropogate(i, forwardPropEvent);
             }
             q.wait();
-            initTo1(biasOutDerivativeSum, lOutSize);
-            paramaterSumDerivatives(weightIn, weightInDerivativeSum, learningRate, lInSize * l1Size);
-            paramaterSumDerivatives(weight1, weight1DerivativeSum, learningRate, l1Size * l2Size);
-            paramaterSumDerivatives(weight2, weight2DerivativeSum, learningRate, l2Size * lOutSize);
-            paramaterSumDerivatives(bias1, bias1DerivativeSum, learningRate, l1Size);
-            paramaterSumDerivatives(bias2, bias2DerivativeSum, learningRate, l2Size);
-            paramaterSumDerivatives(biasOut, biasOutDerivativeSum, learningRate, lOutSize);
+            // Negated for gradient descent
+            paramaterNegateDerivatives(weightIn, weightInDerivative, learningRate, lInSize * l1Size);
+            paramaterNegateDerivatives(weight1, weight1Derivative, learningRate, l1Size * l2Size);
+            paramaterNegateDerivatives(weight2, weight2Derivative, learningRate, l2Size * lOutSize);
+            paramaterNegateDerivatives(bias1, bias1Derivative, learningRate, l1Size);
+            paramaterNegateDerivatives(bias2, bias2Derivative, learningRate, l2Size);
+            paramaterNegateDerivatives(biasOut, biasOutDerivative, learningRate, lOutSize);
             q.wait();
             adjustLearningRate(learningRate);
-            q.wait();
-            if (debugging) {
+            if (batchID == 0) {
                 for (int i = 0; i < 10; i++) {
                     float sigmoidedOutHost[lOutSize];
                     q.memcpy(sigmoidedOutHost, sigmoidedOut + i * lOutSize, lOutSize * sizeof(float)).wait();
                     for (int j = 0; j < lOutSize; j++) cout << sigmoidedOutHost[j] << " ";
                     cout << " Outputs for " << i << "\n---------- - \n";
                 }
-                float biasOutHost[lOutSize];
-                q.memcpy(biasOutHost, biasOut, lOutSize * sizeof(float)).wait();
-                for (int i = 0; i < lOutSize; i++) cout << biasOutHost[i] << " ";
-                cout << " new bias values\n-----------\n";
+                for (int i = 0; i < 10; i++) computeLoss(losses + i, sigmoidedOut + i * lOutSize, lOutSize, i);
                 float lossHost[10];
                 q.memcpy(lossHost, losses, 10 * sizeof(float)).wait();
                 for (int i = 0; i < 10; i++) cout << "Loss = " << lossHost[i] << " ";
                 cout << "\n";
             }
-            
+            if (debugging) {
+                float biasOutHost[lOutSize];
+                q.memcpy(biasOutHost, biasOut, lOutSize * sizeof(float)).wait();
+                for (int i = 0; i < lOutSize; i++) cout << biasOutHost[i] << " ";
+                cout << " new bias values\n-----------\n";
+            }
         }
     }
 
@@ -311,6 +360,36 @@ inline void test() {
     q.memcpy(weight1, weight1Read, l1Size * l2Size * sizeof(float));
     q.memcpy(weight2, weight2Read, l2Size * lOutSize * sizeof(float));
     q.wait();
+
+    float* activationInHost = new float[784];
+    int width, height, channels;
+    auto lastWriteTime = last_write_time("testSample.jpg"); //Make a null value for first time
+    while (true) {
+        this_thread::sleep_for(milliseconds(200));
+        auto currentWriteTime = last_write_time("testSample.jpg");
+        if (currentWriteTime == lastWriteTime) continue;
+        unsigned char* data = stbi_load("testSample.jpg", &width, &height, &channels, 1);
+        if (!data) continue;
+        lastWriteTime = currentWriteTime;
+        for (int x = 0; x < width * height; x++) activationInHost[x] = data[x] / 255.0f;
+        stbi_image_free(data);
+
+        q.memcpy(activationIn, activationInHost, 784 * sizeof(float)).wait();
+        forwardPropogate(0);
+        q.wait();
+
+        float sigmoidedOutHost[lOutSize];
+        q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float)).wait();
+        float maxVal = 0;
+        int maxValI = 0;
+        for (int j = 0; j < lOutSize; j++) {
+            if (sigmoidedOutHost[j] < maxVal) continue;
+            maxVal = sigmoidedOutHost[j];
+            maxValI = j;
+        }
+        cout << "\r" << maxValI << " is most likely, from:   ";
+        for (int j = 0; j < lOutSize; j++) cout << sigmoidedOutHost[j] << " ";
+    }
 }
 
 
@@ -322,7 +401,7 @@ int main() {
     cin >> training;
     cout << "(1 = Debugging, 0 = Not Debugging): ";
     cin >> debugging;
-    cout << "(1 = Signle epoch, 0 = All epochs): ";
+    cout << "(1 = Single epoch, 0 = All epochs): ";
     cin >> singleEpoch;
     
     // Allocates memory for paramaters (weights/biases)
