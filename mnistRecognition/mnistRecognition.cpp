@@ -10,6 +10,7 @@
 #include <sycl/sycl.hpp>
 #include <iostream>
 #include <filesystem>
+#include <random>
 #define STB_IMAGE_IMPLEMENTATION
 #include "VC_IncludePath\stb_image.h"
 using namespace sycl;
@@ -25,8 +26,8 @@ using namespace chrono;
         Furthermore, each batch contains each of the 10 numbers, and the amount of batches can be lowered.
         The amount of epochs can be chosen freely.
 */
-const int lInSize = 784, l1Size = 128, l2Size = 64, lOutSize = 10;
-const int batchCount = 3795, epochCount = 10;
+const int lInSize = 784, l1Size = 128, l2Size = 128, lOutSize = 10;
+const int batchCount = 3795, epochCount = 50;
 const float initialLearningRate = 0.1, finishLearningRate = 0.001;
 
 // Do not adjust anything below
@@ -271,8 +272,13 @@ inline void train() {
         for (int i = 0; i < lOutSize; i++) cout << biasOutHost[i] << " ";
         cout << " initial bias values\n-----------\n";
     }
+
+    vector<int> batchOrder(batchCount);
+    for (int i = 0; i < batchCount; i++) batchOrder[i] = i;
     for (int epoch = 0; epoch < ((singleEpoch) ? 1 : epochCount); epoch++) {
-        for (int batchID = 0; batchID < ((debugging) ? 1 : batchCount); batchID++) {
+        shuffle(batchOrder.begin(), batchOrder.end(), default_random_engine(epoch));
+        for (int batchID : batchOrder) {
+            if (batchID && debugging) continue;
             activationIn = trainingImages + batchID * 10 * lInSize;
             for (int i = 0; i < 10; i++) {
                 auto forwardPropEvent = forwardPropogate(i);
@@ -308,8 +314,8 @@ inline void train() {
                 cout << " new bias values\n-----------\n";
             }
         }
+        cout << "Finished epoch " << epoch + 1 << "\n";
     }
-
     //Collects paramaters from device
     float bias1Host[l1Size], bias2Host[l2Size], biasOutHost[lOutSize],
         weightInHost[lInSize * l1Size], weight1Host[l1Size * l2Size], weight2Host[l2Size * lOutSize];
@@ -380,15 +386,11 @@ inline void test() {
 
         float sigmoidedOutHost[lOutSize];
         q.memcpy(sigmoidedOutHost, sigmoidedOut, lOutSize * sizeof(float)).wait();
-        float maxVal = 0;
-        int maxValI = 0;
-        for (int j = 0; j < lOutSize; j++) {
-            if (sigmoidedOutHost[j] < maxVal) continue;
-            maxVal = sigmoidedOutHost[j];
-            maxValI = j;
-        }
-        cout << "\r" << maxValI << " is most likely, from:   ";
-        for (int j = 0; j < lOutSize; j++) cout << sigmoidedOutHost[j] << " ";
+        float sum = 0;
+        for (int j = 0; j < lOutSize; j++) sum += sigmoidedOutHost[j];
+        for (int j = 0; j < lOutSize; j++) sigmoidedOutHost[j] = std::round(sigmoidedOutHost[j] / sum * 100);
+        cout << "\033[2;0H";
+        for (int j = 0; j < lOutSize; j++) cout << j << " = " << sigmoidedOutHost[j] << "% probability\n";
     }
 }
 
@@ -399,10 +401,12 @@ int main() {
     cout << q.get_device().get_info<info::device::name>() << "\n";
     cout << "(1 = Training, 0 = Testing): ";
     cin >> training;
-    cout << "(1 = Debugging, 0 = Not Debugging): ";
-    cin >> debugging;
-    cout << "(1 = Single epoch, 0 = All epochs): ";
-    cin >> singleEpoch;
+    if (training) {
+        cout << "(1 = Debugging, 0 = Not Debugging): ";
+        cin >> debugging;
+        cout << "(1 = Single epoch, 0 = All epochs): ";
+        cin >> singleEpoch;
+    }
     
     // Allocates memory for paramaters (weights/biases)
     bias1 = malloc_device<float>(l1Size, q);
