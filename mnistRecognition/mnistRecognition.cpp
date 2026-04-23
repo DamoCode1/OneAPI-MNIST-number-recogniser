@@ -31,7 +31,13 @@ const int batchCount = 3795, epochCount = 50;
 const float initialLearningRate = 0.1, finishLearningRate = 0.001;
 
 // Do not adjust anything below
-bool training, debugging, singleEpoch;
+bool training, debugging, singleEpoch, findingAccuracy;
+constexpr int lossType = 2; 
+/* Loss methods:
+* 0 = Summed squared errors (SSE)
+* 1 = Mean squared errors (MSE)
+* 2 = Categorical Cross-entropy (CCE)
+*/
 const float learningRateDecay = std::pow(finishLearningRate / initialLearningRate, 1.0f / (batchCount * epochCount));
 
 //NOTE TO SELF for training 10 epochs: 1 epoch of 3795 batches of 10 took ~126.2s = ~30 batches per second = ~301 images per second = ~3.33 milliseconds per image
@@ -40,6 +46,7 @@ const float learningRateDecay = std::pow(finishLearningRate / initialLearningRat
 queue q;
 float *losses, *learningRate;
 float *trainingImages;
+float* totalLoss;
 
 float *bias1, *bias2, *biasOut;
 float *bias1Derivative, *bias2Derivative, *biasOutDerivative;
@@ -116,7 +123,12 @@ inline event deriveOutputSigmoidLayer(float* sigmoidOut, float* sigmoidOutDeriva
     return q.submit([&](handler& h) {
         h.depends_on(forwardPropEvent);
         h.parallel_for(range<1>(lOutSize), [=](id<1> i) {
-            sigmoidOutDerivative[i] = 2 * (sigmoidOut[i] - ((i == expected) ? 1 : 0));
+            float isExpected = (i == expected) ? 1 : 0;
+            sigmoidOutDerivative[i] =
+                (lossType == 0) ? 2 * (sigmoidOut[i] - isExpected)
+                : (lossType == 1) ? (sigmoidOut[i] - isExpected) / 5
+                : (lossType == 2) ? -isExpected / sigmoidOut[i]
+                : 0;
         });
     });
 }
@@ -194,17 +206,22 @@ inline void initTo0(float* values, int listSize) {
     });
 }
 
-inline void computeLoss(float* lossVal, float* outputLayer, int layerSize, int targetNumber) {
-    q.memset(lossVal, 0, sizeof(float)).wait();
-    q.submit([&](handler& h) {
+inline event computeLoss(float* lossVal, float* outputLayer, int layerSize, int targetNumber, bool reset, event forwardPropogateEvent) {
+    if (reset) q.memset(lossVal, 0, sizeof(float)).wait();
+    return q.submit([&](handler& h) {
+        h.depends_on(forwardPropogateEvent);
         h.parallel_for(range<1>(layerSize), [=](id<1> i) {
             float expectedActivation = (i == targetNumber) ? 1 : 0;
-            float mse = sycl::pow(expectedActivation - outputLayer[i], 2);
+            float neuronLoss = 
+                (lossType == 0) ? sycl::pow(expectedActivation - outputLayer[i], 2)
+                : (lossType == 1) ? sycl::pow(expectedActivation - outputLayer[i], 2) / 10
+                : (lossType == 2) ? -expectedActivation * sycl::log(outputLayer[i])
+                : 0;
             //Atomic prevents incorrect sumation for parallel, relaxed means can be in any order, on device memory globally
             atomic_ref<float, sycl::memory_order::relaxed, memory_scope::device, access::address_space::global_space> atomicSum(*lossVal);
-            atomicSum.fetch_add(mse);
+            atomicSum.fetch_add(neuronLoss);
         });
-    }).wait();
+    });
 }
 
 
@@ -236,6 +253,7 @@ inline void train() {
     learningRate = malloc_device<float>(1, q);
     q.memcpy(learningRate, &initialLearningRate, sizeof(float)).wait();
     trainingImages = malloc_device<float>(10 * batchCount * lInSize, q);
+    totalLoss = malloc_device<float>(1, q);
 
     // Collect and store arrays of images
     float* images = new float[10 * batchCount * lInSize];
@@ -301,7 +319,7 @@ inline void train() {
                     for (int j = 0; j < lOutSize; j++) cout << sigmoidedOutHost[j] << " ";
                     cout << " Outputs for " << i << "\n---------- - \n";
                 }
-                for (int i = 0; i < 10; i++) computeLoss(losses + i, sigmoidedOut + i * lOutSize, lOutSize, i);
+                for (int i = 0; i < 10; i++) computeLoss(losses + i, sigmoidedOut + i * lOutSize, lOutSize, i, true, {});
                 float lossHost[10];
                 q.memcpy(lossHost, losses, 10 * sizeof(float)).wait();
                 for (int i = 0; i < 10; i++) cout << "Loss = " << lossHost[i] << " ";
@@ -315,6 +333,20 @@ inline void train() {
             }
         }
         cout << "Finished epoch " << epoch + 1 << "\n";
+        if (!findingAccuracy) continue;
+        q.memset(totalLoss, 0, sizeof(float)).wait();
+        for (int batchID : batchOrder) {
+            if (batchID && debugging) continue;
+            activationIn = trainingImages + batchID * 10 * lInSize;
+            for (int i = 0; i < 10; i++) {
+                event forwardPropogateEvent = forwardPropogate(i);
+                computeLoss(totalLoss, sigmoidedOut + i * lOutSize, lOutSize, i, false, forwardPropogateEvent);
+            }
+        }
+        q.wait();
+        float totalLossHost[1];
+        q.memcpy(totalLossHost, totalLoss, sizeof(float));
+        cout << "Accuracy = " << totalLossHost[0] << "\n";
     }
     //Collects paramaters from device
     float bias1Host[l1Size], bias2Host[l2Size], biasOutHost[lOutSize],
@@ -406,6 +438,8 @@ int main() {
         cin >> debugging;
         cout << "(1 = Single epoch, 0 = All epochs): ";
         cin >> singleEpoch;
+        cout << "(1 = Finding accuracy, 0 = Not finding accuracy): ";
+        cin >> findingAccuracy;
     }
     
     // Allocates memory for paramaters (weights/biases)

@@ -21,5 +21,6 @@
   </ItemGroup>
   <ItemGroup>
     <Text Include="paramaters.txt" />
+    <Text Include="oldParamaters.txt" />
   </ItemGroup>
 </Project>
