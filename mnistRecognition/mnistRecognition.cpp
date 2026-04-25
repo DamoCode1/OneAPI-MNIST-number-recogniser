@@ -36,7 +36,7 @@ constexpr int lossType = 2;
 /* Loss methods:
 * 0 = Summed squared errors (SSE)
 * 1 = Mean squared errors (MSE)
-* 2 = Categorical Cross-entropy (CCE)
+* 2 = Binary Cross-entropy (BCE)
 */
 const float learningRateDecay = std::pow(finishLearningRate / initialLearningRate, 1.0f / (batchCount * epochCount));
 
@@ -127,7 +127,7 @@ inline event deriveOutputSigmoidLayer(float* sigmoidOut, float* sigmoidOutDeriva
             sigmoidOutDerivative[i] =
                 (lossType == 0) ? 2 * (sigmoidOut[i] - isExpected)
                 : (lossType == 1) ? (sigmoidOut[i] - isExpected) / 5
-                : (lossType == 2) ? -isExpected / sigmoidOut[i]
+                : (lossType == 2) ? sigmoidOut[i] - isExpected
                 : 0;
         });
     });
@@ -215,7 +215,7 @@ inline event computeLoss(float* lossVal, float* outputLayer, int layerSize, int 
             float neuronLoss = 
                 (lossType == 0) ? sycl::pow(expectedActivation - outputLayer[i], 2)
                 : (lossType == 1) ? sycl::pow(expectedActivation - outputLayer[i], 2) / 10
-                : (lossType == 2) ? -expectedActivation * sycl::log(outputLayer[i])
+                : (lossType == 2) ? -expectedActivation * sycl::log(outputLayer[i] + 0.0000001f) - (1 - expectedActivation) * sycl::log(1 - outputLayer[i] + 0.0000001f)
                 : 0;
             //Atomic prevents incorrect sumation for parallel, relaxed means can be in any order, on device memory globally
             atomic_ref<float, sycl::memory_order::relaxed, memory_scope::device, access::address_space::global_space> atomicSum(*lossVal);
@@ -312,7 +312,7 @@ inline void train() {
             paramaterNegateDerivatives(biasOut, biasOutDerivative, learningRate, lOutSize);
             q.wait();
             adjustLearningRate(learningRate);
-            if (batchID == 0) {
+            if (batchID == 0 && findingAccuracy) {
                 for (int i = 0; i < 10; i++) {
                     float sigmoidedOutHost[lOutSize];
                     q.memcpy(sigmoidedOutHost, sigmoidedOut + i * lOutSize, lOutSize * sizeof(float)).wait();
@@ -421,7 +421,7 @@ inline void test() {
         float sum = 0;
         for (int j = 0; j < lOutSize; j++) sum += sigmoidedOutHost[j];
         for (int j = 0; j < lOutSize; j++) sigmoidedOutHost[j] = std::round(sigmoidedOutHost[j] / sum * 100);
-        cout << "\033[2;0H";
+        cout << "\033[3;0H";
         for (int j = 0; j < lOutSize; j++) cout << j << " = " << sigmoidedOutHost[j] << "% probability\n";
     }
 }
