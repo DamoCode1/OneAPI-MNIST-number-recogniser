@@ -3,7 +3,6 @@
 Disclaimer!:
 - Intel oneAPI DPC++ Compiler and libraries are licensed under the MIT License. 
 - This project contains code, data, and concepts that is licensed separately from this project.
-- This project is still in development
 
 Credits:
 - MNIST Dataset source: https://www.kaggle.com/datasets/amineipad/mnist-dataset/data
