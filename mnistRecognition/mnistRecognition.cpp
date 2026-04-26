@@ -27,7 +27,7 @@ using namespace chrono;
         The amount of epochs can be chosen freely.
 */
 const int lInSize = 784, l1Size = 128, l2Size = 128, lOutSize = 10;
-const int batchCount = 3795, epochCount = 50;
+const int batchCount = 3795, epochCount = 200;
 const float initialLearningRate = 0.1, finishLearningRate = 0.001;
 
 // Do not adjust anything below
@@ -127,7 +127,7 @@ inline event deriveOutputSigmoidLayer(float* sigmoidOut, float* sigmoidOutDeriva
             sigmoidOutDerivative[i] =
                 (lossType == 0) ? 2 * (sigmoidOut[i] - isExpected)
                 : (lossType == 1) ? (sigmoidOut[i] - isExpected) / 5
-                : (lossType == 2) ? sigmoidOut[i] - isExpected
+                : (lossType == 2) ? (sigmoidOut[i] - isExpected) / (sigmoidOut[i] * (1 - sigmoidOut[i]))
                 : 0;
         });
     });
